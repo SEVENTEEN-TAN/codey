@@ -769,7 +769,12 @@ pub(crate) async fn connect_upstream_responses_websocket(
         UPSTREAM_WEBSOCKET_CONNECT_TIMEOUT,
         // Responses events are small and latency-sensitive. Disable Nagle on
         // the underlying upstream TCP socket before the TLS/WS handshake.
-        connect_async_with_config(request, Some(config), true),
+        tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            Some(config),
+            true,
+            Some(super::websocket_tls::connector()),
+        ),
     )
     .await
     .context("连接 Responses WebSocket 上游超时")?
@@ -859,14 +864,16 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
         headers: &HeaderMap,
         body: &mut Value,
     ) -> Result<bool> {
-        self.native_history.restore(
-            native_history_key(
-                route,
-                UpstreamWebSocketAuthIdentity::from_headers(headers),
-                body,
-            ),
+        let key = native_history_key(
+            route,
+            UpstreamWebSocketAuthIdentity::from_headers(headers),
             body,
-        )
+        );
+        // Compaction skips the upstream WS attempt that normally stages history.
+        if is_compaction_request(body, ResponsesRequestKind::Create) {
+            self.native_history.prepare(key, body);
+        }
+        self.native_history.restore(key, body)
     }
 
     fn remember_adapted_response(&mut self, response_id: &str, output: &[Value]) -> Result<()> {
