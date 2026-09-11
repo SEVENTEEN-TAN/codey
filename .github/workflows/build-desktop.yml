@@ -3,11 +3,17 @@ name: Build desktop packages
 on:
   workflow_dispatch:
   push:
+    branches:
+      - dev-master
     tags:
       - "v*"
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-desktop-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,9 +21,50 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      publish: ${{ steps.metadata.outputs.publish }}
+      makeLatest: ${{ steps.metadata.outputs.makeLatest }}
+      manifestObject: ${{ steps.metadata.outputs.manifestObject }}
+      updateBasePath: ${{ steps.metadata.outputs.updateBasePath }}
+
+    steps:
+      - name: Checkout Codey
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Derive release metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          METADATA="$(node scripts/release-metadata.mjs \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --package-version "$PACKAGE_VERSION" \
+            --run-number "$GITHUB_RUN_NUMBER")"
+          echo "$METADATA"
+          while IFS='=' read -r key value; do
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done < <(jq -r 'to_entries | map("\(.key)=\(.value | tostring)") | .[]' <<< "$METADATA")
+
   macos:
     name: macOS ${{ matrix.arch }} unsigned
     runs-on: ${{ matrix.runner }}
+    needs: prepare
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +120,7 @@ jobs:
       - name: Build unsigned macOS app
         env:
           CODEY_SKIP_CODESIGN: "1"
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}${{ needs.prepare.outputs.updateBasePath }}
         run: pnpm run build
 
       - name: Verify and archive macOS app
@@ -96,13 +143,7 @@ jobs:
             exit 1
           fi
 
-          VERSION="$(node -p "require('./package.json').version")"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-            VERSION="${VERSION#V}"
-          else
-            VERSION="${VERSION}-${GITHUB_RUN_NUMBER}"
-          fi
+          VERSION="${RELEASE_VERSION}"
           VERSION="${VERSION//\//-}"
 
           mkdir -p dist/macos
@@ -120,7 +161,9 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    needs: prepare
     env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
       CARGO_PROFILE_RELEASE_LTO: thin
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
@@ -209,19 +252,14 @@ jobs:
 
       - name: Build Windows executable
         env:
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}${{ needs.prepare.outputs.updateBasePath }}
         run: pnpm run build
 
       - name: Build Windows packages
         id: package
         shell: pwsh
         run: |
-          $version = node -p "require('./package.json').version"
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $version = $env:GITHUB_REF_NAME.TrimStart("v", "V")
-          } else {
-            $version = "$version-$env:GITHUB_RUN_NUMBER"
-          }
+          $version = $env:RELEASE_VERSION
           $version = $version -replace '[\\/]', '-'
 
           New-Item -ItemType Directory -Force "dist\windows" | Out-Null
@@ -265,12 +303,17 @@ jobs:
 
   publish:
     name: Attach packages to GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.prepare.outputs.publish == 'true'
     needs:
+      - prepare
       - macos
       - windows
     runs-on: macos-14
     env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      MANIFEST_OBJECT: ${{ needs.prepare.outputs.manifestObject }}
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -296,17 +339,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          TAG_VERSION="${TAG_VERSION#V}"
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION" || {
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION." >&2
+          test "$PACKAGE_VERSION" = "$RELEASE_VERSION" || test "$RELEASE_PRERELEASE" = "true" || {
+            echo "Release version $RELEASE_VERSION does not match package.json version $PACKAGE_VERSION." >&2
             exit 1
           }
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Codey ${{ needs.prepare.outputs.version }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          make_latest: ${{ needs.prepare.outputs.makeLatest }}
           generate_release_notes: true
           files: release-assets/*
 
@@ -319,9 +364,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          VERSION="${VERSION#V}"
+          TAG="${RELEASE_TAG}"
+          VERSION="${RELEASE_VERSION}"
           BASE_URL="${CLOUDFLARE_R2_PUBLIC_BASE_URL%/}"
           node scripts/generate-update-manifest.mjs \
             --version "$VERSION" \
@@ -349,7 +393,7 @@ jobs:
               ;;
           esac
 
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           upload_object() {
             local key="$1"
             local file="$2"
@@ -377,4 +421,4 @@ jobs:
             upload_object "releases/${TAG}/${FILE_NAME}" "$ASSET" "$CONTENT_TYPE" "public, max-age=31536000, immutable"
           done
           upload_object "releases/${TAG}/latest.json" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
-          upload_object "latest.json" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
+          upload_object "${MANIFEST_OBJECT}" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
