@@ -47,6 +47,7 @@ class FakeElement extends FakeElementCore {
 }
 
 function loadInjection({
+  archivedSession,
   bridge,
   sessionController,
   dispatcher = async () => {},
@@ -69,6 +70,23 @@ function loadInjection({
     "aria-label": "归档任务",
     class: "native-thread-action",
   });
+  const archivedThread = archivedSession
+    ? new FakeElement("div", { role: "listitem" })
+    : null;
+  const unarchiveButton = archivedSession
+    ? new FakeElement("button", {
+      "aria-label": "取消归档对话",
+      class: "native-thread-action",
+    })
+    : null;
+  if (archivedThread && unarchiveButton) {
+    unarchiveButton.textContent = "取消归档";
+    archivedThread.__reactFiber$archived = {
+      memoizedProps: { archivedThread: archivedSession },
+      pendingProps: null,
+      return: null,
+    };
+  }
   const project = new FakeElement("div", {
     "data-app-action-sidebar-project-id": "/Users/test/workspace",
     "data-app-action-sidebar-project-row": "",
@@ -98,6 +116,10 @@ function loadInjection({
     class: "native-tasks-header-action",
   });
   body.appendChild(thread);
+  if (archivedThread && unarchiveButton) {
+    body.appendChild(archivedThread);
+    archivedThread.appendChild(unarchiveButton);
+  }
   body.appendChild(project);
   body.appendChild(tasksSection);
   thread.appendChild(actionBar);
@@ -232,6 +254,7 @@ function loadInjection({
     actionBar,
     archiveButton,
     archiveTooltip,
+    archivedThread,
     bridgeCalls,
     dispatcherCalls,
     reloadCalls,
@@ -251,6 +274,7 @@ function loadInjection({
     tasksSection,
     newTaskButton,
     thread,
+    unarchiveButton,
     window,
   };
 }
@@ -347,6 +371,57 @@ test("matches native sidebar actions and deletes after popover confirmation", as
   );
   assert.equal(runtime.thread.parentElement, runtime.document.body);
   assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
+});
+
+test("deletes an archived conversation without requiring native cache eviction", async () => {
+  const archivedSession = {
+    id: "7f865d15-2a74-4f02-9c4f-a0925bf96ae3",
+    title: "已归档会话",
+  };
+  const runtime = loadInjection({
+    archivedSession,
+    dispatcher: async (signal) => {
+      if (signal === "unsubscribe-thread-for-host") {
+        throw new Error("archived conversation is not cached");
+      }
+    },
+  });
+
+  runtime.archivedThread.querySelector("[data-codey-session-delete]").click();
+  runtime.document.body.querySelector("[data-codey-session-delete-confirm]").click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const deletion = runtime.bridgeCalls.find(({ path }) => path === "/session/delete");
+  assert.equal(deletion?.payload.sessionId, archivedSession.id);
+  assert.equal(deletion?.payload.title, archivedSession.title);
+  assert.equal(
+    runtime.dispatcherCalls.some(({ signal }) => signal === "unsubscribe-thread-for-host"),
+    false,
+  );
+  assert.equal(
+    runtime.archivedThread.getAttribute("data-codey-session-delete-state"),
+    "deleted",
+  );
+});
+
+test("cancels archived deletion when a virtualized row changes identity", async () => {
+  const runtime = loadInjection({
+    archivedSession: {
+      id: "7f865d15-2a74-4f02-9c4f-a0925bf96ae3",
+      title: "已归档会话",
+    },
+  });
+
+  runtime.archivedThread.querySelector("[data-codey-session-delete]").click();
+  runtime.archivedThread.__reactFiber$archived.memoizedProps.archivedThread = {
+    id: "a62739bf-389b-4d32-b84a-4ddb6892be07",
+    title: "另一条归档会话",
+  };
+  runtime.document.body.querySelector("[data-codey-session-delete-confirm]").click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(runtime.bridgeCalls.some(({ path }) => path === "/session/delete"), false);
+  assert.match(runtime.document.getElementById("codey-runtime-toast")?.textContent, /重新确认/);
 });
 
 test("uses AppServerManager cache eviction and deletion notification on current Codex", async () => {
