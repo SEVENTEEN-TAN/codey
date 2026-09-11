@@ -1786,13 +1786,22 @@ mod cli_wrapper_tests {
         let direct = vec!["model_provider=openai".to_string()];
 
         let enabled = local_router_proxy_bypass_environment(&router, inherited, None);
-        assert_eq!(
-            enabled.len(),
-            1,
-            "Windows must not receive case-conflicting proxy variables"
-        );
-        assert_eq!(enabled[0].0, "NO_PROXY");
+        if cfg!(windows) {
+            assert_eq!(
+                enabled.len(),
+                1,
+                "Windows must not receive case-conflicting proxy variables"
+            );
+            assert_eq!(enabled[0].0, "NO_PROXY");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(enabled.len(), 2, "macOS must preserve both proxy cases");
+            assert_eq!(enabled[0].0, "NO_PROXY");
+            assert_eq!(enabled[1].0, "no_proxy");
+        }
         assert_eq!(enabled[0].1, "corp.internal,127.0.0.1,localhost,::1");
+        if cfg!(target_os = "macos") {
+            assert_eq!(enabled[1].1, "corp.internal,127.0.0.1,localhost,::1");
+        }
         assert!(local_router_proxy_bypass_environment(&direct, inherited, None).is_empty());
     }
 
