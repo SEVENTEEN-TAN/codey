@@ -1036,7 +1036,7 @@ async fn prepare_cli_wrapper(
 /// Local routing terminates at Codey's loopback listener. Keep that hop out of
 /// the user's system proxy while preserving every existing bypass rule. Windows
 /// treats environment keys case-insensitively, so it receives one canonical key.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 fn local_router_proxy_bypass_environment(
     runtime_config_overrides: &[String],
     no_proxy: Option<&str>,
@@ -1069,7 +1069,7 @@ fn local_router_proxy_bypass_environment(
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
     const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
     let mut entries = existing
@@ -1779,6 +1779,7 @@ fn spawn_command(command: Vec<String>) -> Result<SpawnedCodex> {
 mod cli_wrapper_tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn local_router_proxy_bypass_merges_loopback_entries_without_changing_direct_mode() {
         let inherited = Some("corp.internal,127.0.0.1");
